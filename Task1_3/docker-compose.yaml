@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   keycloak_db:
     image: postgres:14
@@ -10,7 +8,7 @@ services:
     volumes:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
-      - "5433:5432"
+      - "5434:5432"
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -31,12 +29,25 @@ services:
       - keycloak_db
   frontend:
     build:
-      context: ./frontend
+      context: frontend
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
+  backend:
+    build:
+      context: bionicpro-auth
+      dockerfile: Dockerfile
+    depends_on:
+      - keycloak
+    ports:
+      - "3001:8081"
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_EXTERNAL_URL: http://localhost:8080
+      KEYCLOAK_REALM: reports-realm
+      CLIENT_ID: bionicpro-auth
+      CLIENT_SECRET: sChLTbIfbZFTkEukHJCy9QVAlrMRBWru
+      FRONTEND_URL: http://localhost:3000
+      CALLBACK_URL: http://localhost:3001/auth/callback
+      ENCRYPTION_KEY: MtB1slTolo0W79QvrNNg658z3vV2wfyYDktbKNk0pRI=
+
