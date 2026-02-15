@@ -120,7 +120,7 @@ def verify_data():
 # Определяем DAG
 with DAG('csv_to_clickhouse_dag',
          default_args=default_args,
-         schedule_interval=None,  # Запускаем каждый час
+         schedule_interval='@hourly',  # Запускаем каждый час
          catchup=False,
          description='Загрузка данных миодатчиков из CSV в ClickHouse') as dag:
 
