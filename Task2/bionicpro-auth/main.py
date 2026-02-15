@@ -6,14 +6,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import secrets
 from config import (
-    KEYCLOAK_INTERNAL_URL, KEYCLOAK_AUTH_URL, KEYCLOAK_TOKEN_URL, KEYCLOAK_REALM, CLIENT_ID, CLIENT_SECRET, CALLBACK_URL,
-    FRONTEND_URL, SESSION_MAX_AGE,
+    KEYCLOAK_AUTH_URL, KEYCLOAK_TOKEN_URL, CLIENT_ID, CLIENT_SECRET, CALLBACK_URL,
+    FRONTEND_URL, SESSION_MAX_AGE, REPORTS_SERVICE_URL
 )
 import session_store
 import jwt
 from database import init_db, async_session
 from models import UserProfile
 from sqlalchemy import select
+from typing import Optional
+from urllib.parse import urlencode
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -90,6 +92,50 @@ def set_session_cookie(response: Response, session_id: str):
 
 # Временное хранилище state (TTL 5 минут)
 _pending_states: dict[str, float] = {}
+
+async def get_valid_session(request: Request) -> tuple[Optional[session_store.SessionData], Optional[str]]:
+
+    session_id = request.cookies.get(COOKIE_NAME)
+    if not session_id:
+        return None, None
+
+    session = session_store.get_session(session_id)
+    if not session:
+        return None, None
+
+    # Если access_token протух — обновляем через refresh_token
+    if session.access_token_expiry <= time.time():
+        refresh_token = session_store.get_refresh_token(session_id)
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                KEYCLOAK_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                },
+            )
+        if token_response.status_code != 200:
+            session_store.delete_session(session_id)
+            return None, None
+
+        tokens = token_response.json()
+        session_store.update_tokens(
+            session_id,
+            tokens["access_token"],
+            tokens["refresh_token"],
+            tokens["expires_in"],
+        )
+        # Получаем обновленную сессию
+        session = session_store.get_session(session_id)
+
+    # Ротация сессии
+    new_session_id = session_store.rotate_session(session_id)
+    if not new_session_id:
+        return None, None
+
+    return session, new_session_id
 
 # --- /auth/login ---
 @app.get("/auth/login")
@@ -170,48 +216,70 @@ async def callback(code: str, state: str):
 # --- /auth/me ---
 @app.get("/auth/me")
 async def me(request: Request, response: Response):
-    # Проверка сессии + автообновление access_token + ротация сессии
-    session_id = request.cookies.get(COOKIE_NAME)
-    if not session_id:
-        return Response(status_code=401)
-
-    session = session_store.get_session(session_id)
-    if not session:
-        return Response(status_code=401)
-
-    # Если access_token протух — обновляем через refresh_token
-    if session.access_token_expiry <= time.time():
-        refresh_token = session_store.get_refresh_token(session_id)
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(
-                KEYCLOAK_TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                },
-            )
-        if token_response.status_code != 200:
-            session_store.delete_session(session_id)
-            return Response(status_code=401)
-
-        tokens = token_response.json()
-        session_store.update_tokens(
-            session_id,
-            tokens["access_token"],
-            tokens["refresh_token"],
-            tokens["expires_in"],
-        )
-
-    # Ротация сессии
-    new_session_id = session_store.rotate_session(session_id)
-    if not new_session_id:
+    session, new_session_id = await get_valid_session(request)
+    if not session or not new_session_id:
         return Response(status_code=401)
 
     resp = Response(content='{"status": "authenticated"}', media_type="application/json")
     set_session_cookie(resp, new_session_id)
+
     return resp
+
+# --- /auth/report ---
+@app.get("/api/report")
+async def get_report(
+        request: Request,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: Optional[int] = None
+):
+    """
+    Проксирование запроса на получение отчёта в сервис reports.
+    Извлекает access_token из сессии и передаёт его в Authorization header.
+    """
+    session, new_session_id = await get_valid_session(request)
+    if not session or not new_session_id:
+        return Response(status_code=401)
+
+    # Получаем актуальный access_token
+    access_token = session.access_token
+    if not access_token:
+        return Response(status_code=401)
+
+    # Формируем query параметры
+    params = {}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    if limit:
+        params["limit"] = limit
+
+    # Проксируем запрос в сервис отчётов
+    reports_url = f"{REPORTS_SERVICE_URL}/api/report"
+    if params:
+        reports_url += f"?{urlencode(params)}"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            proxy_response = await client.get(
+                reports_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                },
+                timeout=30.0
+            )
+
+            resp = Response(
+                content=proxy_response.content,
+                status_code=proxy_response.status_code,
+                media_type="application/json"
+            )
+            set_session_cookie(resp, new_session_id)
+            return resp
+        except Exception:
+            return Response(status_code=503)
 
 # if __name__ == "__main__":
 #     import uvicorn
