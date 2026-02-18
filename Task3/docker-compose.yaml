@@ -1,0 +1,198 @@
+services:
+  keycloak_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: keycloak_db
+      POSTGRES_USER: keycloak_user
+      POSTGRES_PASSWORD: keycloak_password
+    volumes:
+      - ./postgres-keycloak-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - auth_net
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0.6
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
+      KC_DB_USERNAME: keycloak_user
+      KC_DB_PASSWORD: keycloak_password
+    command: 
+      - start-dev
+      - --import-realm
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    ports:
+      - "8080:8080"
+    depends_on:
+      - keycloak_db
+    networks:
+      - auth_net
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    networks:
+      - auth_net
+
+  gateway:
+    build:
+      context: gateway
+      dockerfile: Dockerfile
+    depends_on:
+      keycloak:
+        condition: service_started
+      auth_db:
+        condition: service_healthy
+    ports:
+      - "3001:8081"
+    environment:
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_EXTERNAL_URL: http://localhost:8080
+      KEYCLOAK_REALM: reports-realm
+      CLIENT_ID: bionicpro-auth
+      CLIENT_SECRET: sChLTbIfbZFTkEukHJCy9QVAlrMRBWru
+      FRONTEND_URL: http://localhost:3000
+      CALLBACK_URL: http://localhost:3001/auth/callback
+      ENCRYPTION_KEY: MtB1slTolo0W79QvrNNg658z3vV2wfyYDktbKNk0pRI=
+      DATABASE_URL: postgresql+asyncpg://auth_user:auth_password@auth_db:5432/bionicpro_auth?ssl=disable
+      REPORTS_SERVICE_URL: http://reports-api:8080
+    networks:
+      - auth_net
+
+  auth_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: bionicpro_auth
+      POSTGRES_USER: auth_user
+      POSTGRES_PASSWORD: auth_password
+    volumes:
+      - ./postgres-auth-data:/var/lib/postgresql/data
+      - ./init-scripts/init-auth-db.sql:/docker-entrypoint-initdb.d/init-auth-db.sql
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U auth_user -d bionicpro_auth" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - auth_net
+
+  reports-api:
+    build:
+      context: reports-api
+      dockerfile: Dockerfile
+    ports:
+      - "3003:8080"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: clickhouse_user
+      CLICKHOUSE_PASSWORD: clickhouse_password
+      CLICKHOUSE_DATABASE: bionicpro
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: reports-realm
+      AUTH_DATABASE_URL: postgresql://auth_user:auth_password@auth_db:5432/bionicpro_auth
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: reports
+      CDN_BASE_URL: http://cdn:80
+    depends_on:
+      keycloak:
+        condition: service_started
+      auth_db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - auth_net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native client port
+    volumes:
+      - ./clickhouse/data:/var/lib/clickhouse
+      - ./clickhouse/logs:/var/log/clickhouse-server
+      - ./clickhouse:/var/lib/clickhouse/user_files
+      - ./clickhouse/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    environment:
+      CLICKHOUSE_DB: bionicpro
+      CLICKHOUSE_USER: clickhouse_user
+      CLICKHOUSE_PASSWORD: clickhouse_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_ALWAYS_RUN_INITDB_SCRIPTS: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - auth_net
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9010:9000"   # S3 API
+      - "9011:9001"   # Web-консоль MinIO
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - auth_net
+
+  # Одноразовый контейнер: создаёт бакет и ставит публичную политику чтения,
+  # чтобы nginx мог читать файлы без S3-авторизации.
+  # Безопасность обеспечивается auth_request на уровне nginx.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/reports;
+        mc anonymous set download local/reports;
+        mc ilm rule add local/reports --expire-days 7;
+        echo 'MinIO bucket initialized with 7-day lifecycle policy';        
+      "
+    networks:
+      - auth_net
+
+  cdn:
+    build:
+      context: cdn
+      dockerfile: Dockerfile
+    ports:
+      - "8888:80"
+    depends_on:
+      - minio
+      - reports-api
+    networks:
+      - auth_net
+
+volumes:
+  minio-data:
+
+networks:
+  auth_net:
+    driver: bridge

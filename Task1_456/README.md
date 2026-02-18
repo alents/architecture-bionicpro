@@ -1,0 +1,2 @@
+В данной папке решения пунктов 4,5,6 задания 1. Настройки Keycloak выгружены в [keycloak-results-export.json](keycloak/keycloak-results-export.json)  
+Для того чтобы заработала авторизация через IDP Yandex, пришлось подключить расширение keycloak-russian-providers.

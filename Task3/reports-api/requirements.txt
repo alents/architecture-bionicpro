@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+clickhouse-connect
+pydantic
+asyncpg
+pyjwt[crypto]
+boto3
