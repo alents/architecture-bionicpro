@@ -266,7 +266,7 @@ async def get_user_report(
                     signal_duration,
                     signal_amplitude,
                     signal_time
-                FROM bionicpro.emg_sensor_data
+                FROM bionicpro.emg_user_report
                 WHERE user_id = {user_id:UInt32}
                   AND signal_time >= {start_date:DateTime}
                   AND signal_time <= {end_date:DateTime}
@@ -295,7 +295,7 @@ async def get_user_report(
                           avg(signal_duration) as avg_duration,
                           uniq(prosthesis_type) as unique_prosthesis_types,
                           uniq(muscle_group) as unique_muscle_groups
-                      FROM bionicpro.emg_sensor_data
+                      FROM bionicpro.emg_user_report
                       WHERE user_id = {user_id:UInt32}
                         AND signal_time >= {start_date:DateTime}
                         AND signal_time <= {end_date:DateTime} \

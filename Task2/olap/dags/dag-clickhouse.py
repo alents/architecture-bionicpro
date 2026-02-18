@@ -1,17 +1,18 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
-import csv
 from clickhouse_driver import Client
+import psycopg2
 import os
 
-# Аргументы по умолчанию
 default_args = {
     'owner': 'airflow',
     'start_date': datetime(2026, 1, 1),
 }
 
-# Функция для получения клиента ClickHouse из переменных окружения
+BATCH_SIZE = 1000
+
+
 def get_clickhouse_client():
     return Client(
         host=os.getenv('CLICKHOUSE_HOST', 'clickhouse'),
@@ -22,125 +23,139 @@ def get_clickhouse_client():
     )
 
 
-# Функция для создания таблицы
-def create_table():
-    client = get_clickhouse_client()
+def get_postgres_connection():
+    return psycopg2.connect(
+        host=os.getenv('CRM_DB_HOST', 'crm_db'),
+        port=int(os.getenv('CRM_DB_PORT', '5432')),
+        dbname=os.getenv('CRM_DB_NAME', 'bionicpro_crm'),
+        user=os.getenv('CRM_DB_USER', 'crm_user'),
+        password=os.getenv('CRM_DB_PASSWORD', 'crm_password'),
+    )
 
-    client.execute("""
-                   CREATE TABLE IF NOT EXISTS emg_sensor_data (
-                                                                  user_id UInt32,
-                                                                  prosthesis_type String,
-                                                                  muscle_group String,
-                                                                  signal_frequency UInt32,
-                                                                  signal_duration UInt32,
-                                                                  signal_amplitude Decimal(5,2),
-                       signal_time DateTime
-                       ) ENGINE = MergeTree()
-                       ORDER BY (user_id, prosthesis_type, signal_time);
-                   """)
 
-    print("✓ Таблица emg_sensor_data создана или уже существует")
-    client.disconnect()
+def load_emg_sensor_data():
+    """Извлекает emg_sensor_data из PostgreSQL и загружает в ClickHouse."""
+    pg_conn = get_postgres_connection()
+    pg_cursor = pg_conn.cursor()
+    ch_client = get_clickhouse_client()
 
-# Функция для загрузки данных в ClickHouse
-def load_csv_to_clickhouse():
-    CSV_FILE_PATH = '/opt/airflow/sample_files/olap.csv'
+    # Очищаем таблицу перед полной загрузкой
+    ch_client.execute("TRUNCATE TABLE IF EXISTS emg_sensor_data")
 
-    BATCH_SIZE = 1000
-
-    client = get_clickhouse_client()
+    pg_cursor.execute("""
+                      SELECT user_id, prosthesis_type, muscle_group,
+                             signal_frequency, signal_duration, signal_amplitude, signal_time
+                      FROM emg_sensor_data
+                      """)
 
     total_inserted = 0
     batch = []
+    sql = "INSERT INTO emg_sensor_data VALUES"
 
-    print(f"Начинаем загрузку с размером батча: {BATCH_SIZE} записей")
-
-    # Читаем CSV и формируем данные для вставки
-    data_to_insert = []
-    with open(CSV_FILE_PATH, 'r') as csvfile:
-        csvreader = csv.DictReader(csvfile)
-
-        sql = "INSERT INTO emg_sensor_data VALUES"
-
-        for row in csvreader:
-            # Добавляем строку в батч
-            print(row['user_id'], row['prosthesis_type'], row['muscle_group'], row['signal_frequency'], row['signal_duration'], row['signal_amplitude'], row['signal_time'])
-            batch.append((
-                int(row['user_id']),
-                row['prosthesis_type'],
-                row['muscle_group'],
-                int(row['signal_frequency']),
-                int(row['signal_duration']),
-                float(row['signal_amplitude']),
-                datetime.strptime(row['signal_time'], '%Y-%m-%d %H:%M:%S')
-            ))
-
-            # Когда батч заполнен - вставляем и очищаем
-            if len(batch) >= BATCH_SIZE:
-                client.execute(sql, batch)
-                total_inserted += len(batch)
-                print(f"✓ Вставлено {len(batch)} записей (всего: {total_inserted})")
-                batch = []  # Очищаем батч для освобождения памяти
-
-        # Вставляем оставшиеся записи (если есть)
-        if batch:
-            client.execute(sql, batch)
+    for row in pg_cursor:
+        batch.append(row)
+        if len(batch) >= BATCH_SIZE:
+            ch_client.execute(sql, batch)
             total_inserted += len(batch)
-            print(f"Вставлено {len(batch)} записей (всего: {total_inserted})")
+            print(f"✓ emg_sensor_data: вставлено {len(batch)} записей (всего: {total_inserted})")
+            batch = []
 
-    print(f"Всего успешно загружено {total_inserted} записей в ClickHouse")
-    client.disconnect()
+    if batch:
+        ch_client.execute(sql, batch)
+        total_inserted += len(batch)
 
-# Функция для проверки загруженных данных
+    print(f"✓ emg_sensor_data: всего загружено {total_inserted} записей")
+
+    pg_cursor.close()
+    pg_conn.close()
+    ch_client.disconnect()
+
+
+def load_user_profiles():
+    """Извлекает user_profiles из PostgreSQL и загружает в ClickHouse."""
+    pg_conn = get_postgres_connection()
+    pg_cursor = pg_conn.cursor()
+    ch_client = get_clickhouse_client()
+
+    # Очищаем таблицу перед полной загрузкой
+    ch_client.execute("TRUNCATE TABLE IF EXISTS user_profiles")
+
+    pg_cursor.execute("""
+                      SELECT user_id, subject_id, email, first_name, last_name, identity_provider
+                      FROM user_profiles
+                      """)
+
+    rows = pg_cursor.fetchall()
+    if rows:
+        sql = "INSERT INTO user_profiles VALUES"
+        ch_client.execute(sql, rows)
+
+    print(f"✓ user_profiles: загружено {len(rows)} записей")
+
+    pg_cursor.close()
+    pg_conn.close()
+    ch_client.disconnect()
+
+
 def verify_data():
+    """Проверяет данные в обеих таблицах и витрине."""
     client = get_clickhouse_client()
 
+    # Проверка emg_sensor_data
     result = client.execute("""
                             SELECT
                                 count() as total_records,
                                 uniq(user_id) as unique_users,
                                 min(signal_time) as earliest_signal,
                                 max(signal_time) as latest_signal
-                            FROM emg_sensor_data;
+                            FROM emg_sensor_data
                             """)
-
     if result:
         total, unique_users, earliest, latest = result[0]
         print(f"\n{'='*50}")
-        print(f"СТАТИСТИКА ЗАГРУЖЕННЫХ ДАННЫХ:")
-        print(f"{'='*50}")
-        print(f"Всего записей: {total}")
-        print(f"Уникальных пользователей: {unique_users}")
-        print(f"Самый ранний сигнал: {earliest}")
-        print(f"Самый поздний сигнал: {latest}")
-        print(f"{'='*50}\n")
+        print(f"EMG_SENSOR_DATA:")
+        print(f"  Всего записей: {total}")
+        print(f"  Уникальных пользователей: {unique_users}")
+        print(f"  Период: {earliest} — {latest}")
+
+    # Проверка user_profiles
+    result = client.execute("SELECT count() FROM user_profiles")
+    if result:
+        print(f"\nUSER_PROFILES:")
+        print(f"  Всего записей: {result[0][0]}")
+
+    # Проверка витрины
+    result = client.execute("SELECT count() FROM emg_user_report")
+    if result:
+        print(f"\nВИТРИНА EMG_USER_REPORT:")
+        print(f"  Всего записей: {result[0][0]}")
+    print(f"{'='*50}\n")
 
     client.disconnect()
 
-# Определяем DAG
-with DAG('csv_to_clickhouse_dag',
-         default_args=default_args,
-         schedule_interval='@hourly',  # Запускаем каждый час
-         catchup=False,
-         description='Загрузка данных миодатчиков из CSV в ClickHouse') as dag:
 
-    # Создаем таблицу в ClickHouse
-    create_table_task = PythonOperator(
-        task_id='create_table',
-        python_callable=create_table
+with DAG(
+        'crm_to_clickhouse_dag',
+        default_args=default_args,
+        schedule_interval='@hourly',
+        catchup=False,
+        description='Загрузка данных из CRM (PostgreSQL) в ClickHouse'
+) as dag:
+
+    load_emg_task = PythonOperator(
+        task_id='load_emg_sensor_data',
+        python_callable=load_emg_sensor_data
     )
 
-    # Загружаем данные из CSV
-    load_data_task = PythonOperator(
-        task_id='load_csv_to_clickhouse',
-        python_callable=load_csv_to_clickhouse
+    load_profiles_task = PythonOperator(
+        task_id='load_user_profiles',
+        python_callable=load_user_profiles
     )
 
-    # Проверяем количество загруженных записей
-    verify_data_task = PythonOperator(
-        task_id='verify_data_count',
+    verify_task = PythonOperator(
+        task_id='verify_data',
         python_callable=verify_data
     )
 
-    # Определяем порядок выполнения
-    create_table_task >> load_data_task >> verify_data_task
+    # Загрузка двух таблиц параллельно, затем верификация
+    [load_emg_task, load_profiles_task] >> verify_task
