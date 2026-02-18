@@ -1,26 +1,18 @@
 # Кеширование отчётов: S3 + CDN
 
-## Архитектура
-
-```
-Клиент (React) → Gateway → Reports-API → ClickHouse
-                    ↓              ↓
-                   CDN (nginx) ← MinIO (S3)
-```
-
-Gateway — единственная точка входа для клиента. Клиент не имеет прямого доступа ни к S3, ни к CDN. Access token хранится в серверной сессии gateway и не попадает в браузер.
-
 ## Как работает запрос отчёта
 
-1. Клиент запрашивает `GET /api/report/{report_name}?start_date=...&end_date=...` у gateway.
+1. Клиент(frontend) запрашивает отчет `GET /api/report/{report_name}?start_date=...&end_date=...` у gateway service.
 2. Gateway извлекает access_token из сессии и проксирует запрос в reports-api.
-3. Reports-api проверяет, есть ли отчёт в S3 (MinIO) по ключу `{report_name}/{user_id}/{start}_{end}.json`.
+3. Reports-api проверяет токен и смотрит, есть ли отчёт для пользователя в S3 (MinIO) по ключу `{report_name}/{user_id}/{start}_{end}.json`.
 4. Если отчёта нет — генерирует из ClickHouse, сохраняет в S3.
 5. Reports-api возвращает CDN-ссылку gateway.
 6. Gateway обращается к CDN (nginx) с access_token.
 7. Nginx выполняет auth subrequest к reports-api `/auth/verify` — проверяет JWT и совпадение user_id из токена с user_id в запрашиваемом пути.
 8. При успешной авторизации nginx отдаёт файл из кеша или проксирует к MinIO.
 9. Gateway возвращает JSON-содержимое клиенту.
+
+**Gateway — единственная точка входа для клиента. Клиент не имеет прямого доступа ни к S3, ни к CDN. Access token хранится в серверной сессии gateway и не попадает в браузер.**
 
 ## Структура хранения в S3
 
@@ -58,5 +50,6 @@ Nginx выполняет auth subrequest к reports-api перед отдаче�
 1. JWT-токен валиден (подпись через JWKS Keycloak).
 2. user_id из токена совпадает с user_id в запрашиваемом пути.
 
-Бакет MinIO открыт на чтение (anonymous download), но доступ возможен только через nginx с проверкой авторизации.
+MinIO доступен только внутри закрытой внутренней сети и не имеет прямого доступа извне. Чтение из бакета открыто без S3-авторизации, 
+поскольку к нему обращается только nginx — доверенный сервис, который проверяет права доступа через auth subrequest до обращения к MinIO. Запись в бакет выполняется reports-api с авторизацией по ключам S3.
 
